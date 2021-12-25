@@ -1,59 +1,60 @@
-extern crate mio;
-use mio::*;
-use std::net::SocketAddr;
-use mio::net::*;
-use std::collections::HashMap;
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpListener;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
-const SERVER_TOKEN: Token = Token(0);
-const MAX_SOCKETS: usize = 2048;
+const LOCAL: &str = "127.0.0.1:7000";
+const MSG_SIZE: usize = 32;
+
+fn sleep() {
+    thread::sleep(::std::time::Duration::from_millis(100));
+}
 
 fn main() {
-    let mut event_loop = Poll::new().unwrap();
+    let server = TcpListener::bind(LOCAL).expect("Listener failed to bind.");
+    server.set_nonblocking(true).expect("Failed to initialize non-blocking"); // ensure we can listen to messages continuously
 
-    let address = "0.0.0.0:1000".parse::<SocketAddr>().unwrap();
-    let server_socket = TcpListener::bind(&address).unwrap();
+    let mut clients = vec![];
+    let (tx, rx) = mpsc::channel::<String>(); // transmitter, receiver
 
-    event_loop.register(&server_socket, 
-                        Token(0),
-                        Ready::readable(),
-                        PollOpt::edge()).unwrap();
+    loop {
+        if let Ok((mut socket, addr)) = server.accept() { // when we receive a valid message
+            println!("Client {} connected", addr);
+            let tx = tx.clone();
+            clients.push(socket.try_clone().expect("failed to clone client"));
 
-    let mut sockets = HashMap::new();
-    let mut next_socket_index = 0;
-    let mut events = Events::with_capacity(1024);
+            thread::spawn(move || loop {
+                let mut buff = vec![0; MSG_SIZE];
 
-    event_loop.poll(&mut events, None).unwrap();
+                match socket.read_exact(&mut buff) {
+                    Ok(_) => {
+                        let msg = buff.into_iter().take_while(|&x| x != 0).collect::<Vec<_>>();
+                        let msg = String::from_utf8(msg).expect("Invalid utf8 message");
 
-    for event in &events {
-        match event.token() {
-            SERVER_TOKEN => {
-                loop {
-                    let mut buf = [0; 2048];
-                    match server_socket.accept() {
-                        Err(e) => {
-                            println!("Error reading socket: {}", e);
-                            return
-                        },
-                        Ok((socket, _)) => {
-                            if next_socket_index == MAX_SOCKETS {
-                                return;
-                            }
-                            let token = Token(next_socket_index);
-                            next_socket_index += 1;
-                            event_loop.register(&socket,
-                                        token,
-                                        Ready::readable(),
-                                        PollOpt::edge()).unwrap();
-                            sockets.insert(token, socket);
-                        },
-
+                        println!("{}: {:?}", addr, msg);
+                        tx.send(msg).expect("Failed to send msg to receiver"); // send message back to client
+                    },
+                    Err(ref err) if err.kind() == ErrorKind::WouldBlock => (),
+                    Err(_) => {
+                        println!("Closing connection with {}", addr);
+                        break;
                     }
                 }
-            }
-            token => {
-                
-            }
-        }
-    }
 
+                sleep();
+            });
+        }
+
+        if let Ok(msg) = rx.try_recv() { // receive message from client
+            clients = clients.into_iter().filter_map(|mut client| {
+                let mut buff = msg.clone().into_bytes();
+                buff.resize(MSG_SIZE, 0);
+
+                client.write_all(&buff).map(|_| client).ok()
+            }).collect::<Vec<_>>();
+        }
+
+        sleep();
+    }
 }
